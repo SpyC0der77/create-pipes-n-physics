@@ -53,7 +53,7 @@
   "pipesnphysics.ponder.fluid_dynamics.header": "Fluid Dynamics",
   "pipesnphysics.ponder.fluid_dynamics.text_1": "Fluid naturally flows from high to low pressure",
   "pipesnphysics.ponder.fluid_dynamics.text_2": "A vertical drop creates 'head', pushing fluid down",
-  "pipesnphysics.ponder.fluid_dynamics.text_3": "Connected tanks settle at the same waterline — the lower tank holds more fluid",
+  "pipesnphysics.ponder.fluid_dynamics.text_3": "Without a pump, connected tanks will equalize their levels",
   "pipesnphysics.ponder.fluid_dynamics.text_4": "Long pipe runs add friction, slowing down the flow",
   "pipesnphysics.ponder.fluid_dynamics.text_5": "A Mechanical Pump adds extra head to overcome gravity or friction",
   "pipesnphysics.ponder.fluid_dynamics.text_6": "The pump's lift capacity depends directly on its RPM",

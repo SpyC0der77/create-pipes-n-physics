@@ -18,6 +18,7 @@ public class PipesNPhysicsConfig {
     public static final ModConfigSpec.DoubleValue PUMP_FLOW_PER_RPM;
     public static final ModConfigSpec.IntValue MAX_FLOW_PER_ENDPOINT;
     public static final ModConfigSpec.DoubleValue SUCTION_LIMIT;
+    public static final ModConfigSpec.BooleanValue SCALE_SUCTION_BY_DENSITY;
     public static final ModConfigSpec.BooleanValue ENABLE_OPEN_END_INTAKE;
     public static final ModConfigSpec.IntValue OPEN_END_INTAKE_COOLDOWN_TICKS;
     public static final ModConfigSpec.BooleanValue ENABLE_DYNAMIC_TANK_MASS;
@@ -61,8 +62,14 @@ public class PipesNPhysicsConfig {
                 .defineInRange("maxFlowPerEndpoint", 256, 1, 8192);
         SUCTION_LIMIT = server
                 .comment("How many blocks the head at a pipe's highest point may sit below that point",
-                        "before the liquid column breaks (the siphon / cavitation limit).")
+                        "before the liquid column breaks (the siphon / cavitation limit).",
+                        "This is the reference for water-density fluids; denser fluids siphon less far",
+                        "when scaleSuctionByDensity is enabled.")
                 .defineInRange("suctionLimitBlocks", 8.0, 0.0, 256.0);
+        SCALE_SUCTION_BY_DENSITY = server
+                .comment("Scale the siphon/cavitation limit by fluid density: lava (~3× water)",
+                        "can only hold about one-third as tall a suction column.")
+                .define("scaleSuctionByDensity", true);
         ENABLE_OPEN_END_INTAKE = server
                 .comment("Let an open pipe end draw fluid IN from the world when the network is under",
                         "suction (its head sits below the pipe mouth): a self-regenerating source (a",

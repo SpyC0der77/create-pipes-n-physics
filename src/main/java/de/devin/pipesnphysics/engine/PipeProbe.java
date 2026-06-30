@@ -3,6 +3,7 @@ package de.devin.pipesnphysics.engine;
 import com.simibubi.create.content.kinetics.base.KineticBlockEntity;
 import de.devin.pipesnphysics.PipesNPhysicsConfig;
 import de.devin.pipesnphysics.compat.SableCompat;
+import de.devin.pipesnphysics.physics.FluidPhysics;
 import de.devin.pipesnphysics.engine.net.PipeStatusPayload;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -110,7 +111,7 @@ public final class PipeProbe {
         }
         boolean hasSuction = hasPressure && runWorstPressure < -0.05f && !isGas(fluid);
         float suctionMargin = hasSuction
-                ? (float) (PipesNPhysicsConfig.SUCTION_LIMIT.get() + runWorstPressure) : 0;
+                ? (float) (suctionLimitFor(fluid) + runWorstPressure) : 0;
         return new PipeStatusPayload(pos, status, actualFlow, direction,
                 fluid.copyWithAmount(1), hasPressure, pressure, hasHeadroom, headroom, headTotal,
                 detail, hasSuction, suctionMargin, false, 0, 0);
@@ -297,7 +298,7 @@ public final class PipeProbe {
         }
         boolean hasSuction = hasPressure && pressure < -0.05f && !isGas(fluid);
         float suctionMargin = hasSuction
-                ? (float) (PipesNPhysicsConfig.SUCTION_LIMIT.get() + pressure) : 0;
+                ? (float) (suctionLimitFor(fluid) + pressure) : 0;
 
         Solution.PumpLoad load = solution.pumpLoads().get(node.index());
         boolean hasPumpLoad = load != null;
@@ -361,5 +362,11 @@ public final class PipeProbe {
     private static Direction directionBetween(BlockPos from, BlockPos to) {
         return Direction.fromDelta(
                 to.getX() - from.getX(), to.getY() - from.getY(), to.getZ() - from.getZ());
+    }
+
+    private static double suctionLimitFor(FluidStack fluid) {
+        double base = PipesNPhysicsConfig.SUCTION_LIMIT.get();
+        if (!PipesNPhysicsConfig.SCALE_SUCTION_BY_DENSITY.get() || fluid.isEmpty()) return base;
+        return FluidPhysics.suctionLimitBlocks(fluid.getFluid().getFluidType(), base);
     }
 }

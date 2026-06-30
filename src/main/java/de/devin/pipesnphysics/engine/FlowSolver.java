@@ -4,6 +4,7 @@ import com.simibubi.create.content.fluids.FluidPropagator;
 import com.simibubi.create.content.kinetics.base.KineticBlockEntity;
 import de.devin.pipesnphysics.PipesNPhysicsConfig;
 import de.devin.pipesnphysics.compat.SableCompat;
+import de.devin.pipesnphysics.physics.FluidPhysics;
 import de.devin.pipesnphysics.engine.solve.NetworkSolver;
 import de.devin.pipesnphysics.engine.solve.NetworkSolver.BranchSpec;
 import de.devin.pipesnphysics.engine.solve.NetworkSolver.NodeSpec;
@@ -234,8 +235,11 @@ public final class FlowSolver {
                                       Set<BlockPos> claimedEmpties, GroupResults results) {
         FluidType type = sample.getFluid().getFluidType();
         boolean gas = type.isLighterThanAir();
-        double viscosityScale = 1000.0 / Math.max(1, type.getViscosity());
-        double conductancePerTile = PipesNPhysicsConfig.PIPE_CONDUCTANCE.get() * viscosityScale;
+        double conductancePerTile = PipesNPhysicsConfig.PIPE_CONDUCTANCE.get()
+                * FluidPhysics.viscosityConductanceScale(type);
+        double suctionLimit = PipesNPhysicsConfig.SCALE_SUCTION_BY_DENSITY.get()
+                ? FluidPhysics.suctionLimitBlocks(type, PipesNPhysicsConfig.SUCTION_LIMIT.get())
+                : PipesNPhysicsConfig.SUCTION_LIMIT.get();
 
         int[] solverIndex = new int[graph.nodes().size()];
         Arrays.fill(solverIndex, -1);
@@ -270,8 +274,7 @@ public final class FlowSolver {
         }
         if (branches.isEmpty()) return false;
 
-        NetworkSolver.Result result = NetworkSolver.solve(nodeSpecs, branches, 1,
-                PipesNPhysicsConfig.SUCTION_LIMIT.get());
+        NetworkSolver.Result result = NetworkSolver.solve(nodeSpecs, branches, 1, suctionLimit);
 
         recordDisplayHeads(graph, solverIndex, nodeSpecs, canSupply, branches, result,
                 gas, results.nodeHeads, results.nodeCeilings, results.nodeAnchors);
