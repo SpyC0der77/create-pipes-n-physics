@@ -14,6 +14,7 @@ import net.minecraft.tags.TagKey;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.FluidState;
 import net.neoforged.neoforge.capabilities.Capabilities;
 
 import java.util.ArrayDeque;
@@ -248,6 +249,7 @@ public final class GraphBuilder {
                     conns.add(neighbor.immutable());
                 }
             }
+            registerWaterloggedPipeOpenEnd(cur, curState, conns, d);
             d.connections.put(cur, conns);
         }
 
@@ -269,6 +271,31 @@ public final class GraphBuilder {
         }
 
         return d;
+    }
+
+    /**
+     * A waterlogged pipe holds a fluid source in its own block state rather than in the
+     * neighbor space {@link FluidPropagator#isOpenEnd} looks at. Model that fluid as an
+     * open mouth at the pipe cell so pumps can draw from vertical intake runs.
+     */
+    private static void registerWaterloggedPipeOpenEnd(BlockPos cur, BlockState curState,
+                                                        List<BlockPos> conns, Discovery d) {
+        FluidState fluid = curState.getFluidState();
+        if (fluid.isEmpty() || !fluid.isSource()) return;
+        if (d.openEnds.containsKey(cur)) return;
+        Direction towardNetwork = connectionFrom(cur, conns);
+        if (towardNetwork == null) return;
+        d.openEnds.put(cur, towardNetwork);
+    }
+
+    /** Direction from {@code cur} toward the first connected network cell, if any. */
+    private static Direction connectionFrom(BlockPos cur, List<BlockPos> conns) {
+        for (BlockPos neighbor : conns) {
+            for (Direction dir : Direction.values()) {
+                if (cur.relative(dir).equals(neighbor)) return dir;
+            }
+        }
+        return null;
     }
 
     /**

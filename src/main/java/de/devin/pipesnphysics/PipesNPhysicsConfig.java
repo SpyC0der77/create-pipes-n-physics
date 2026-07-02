@@ -1,6 +1,9 @@
 package de.devin.pipesnphysics;
 
+import de.devin.pipesnphysics.client.EngineConfigClient;
+import net.minecraft.world.level.Level;
 import net.neoforged.neoforge.common.ModConfigSpec;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Server + client config for the v1 engine. Most knobs from the v0 build are
@@ -10,6 +13,15 @@ import net.neoforged.neoforge.common.ModConfigSpec;
 public class PipesNPhysicsConfig {
     public static final ModConfigSpec SERVER_SPEC;
     public static final ModConfigSpec CLIENT_SPEC;
+
+    /**
+     * Whether the hydraulic engine is active for this side. Server reads {@link #ENABLE_ENGINE};
+     * clients read the value synced on login ({@link EngineConfigClient}).
+     */
+    public static boolean isEngineEnabled(@Nullable Level level) {
+        if (level != null && level.isClientSide()) return EngineConfigClient.isEnabled();
+        return ENABLE_ENGINE.get();
+    }
 
     // Server
     public static final ModConfigSpec.BooleanValue ENABLE_ENGINE;

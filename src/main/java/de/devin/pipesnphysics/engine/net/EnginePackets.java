@@ -1,6 +1,7 @@
 package de.devin.pipesnphysics.engine.net;
 
 import de.devin.pipesnphysics.PipesNPhysics;
+import de.devin.pipesnphysics.client.EngineConfigClient;
 import de.devin.pipesnphysics.client.PumpRangeClient;
 import de.devin.pipesnphysics.engine.PipeProbe;
 import de.devin.pipesnphysics.engine.PumpRangeProbe;
@@ -24,6 +25,10 @@ public final class EnginePackets {
     public static void register(RegisterPayloadHandlersEvent event) {
         var registrar = event.registrar(PipesNPhysics.ID).versioned("2");
         registrar.playToClient(
+                EngineConfigPayload.TYPE,
+                EngineConfigPayload.STREAM_CODEC,
+                EnginePackets::onEngineConfig);
+        registrar.playToClient(
                 GraphOverlayPayload.TYPE,
                 GraphOverlayPayload.STREAM_CODEC,
                 EnginePackets::onGraphOverlay);
@@ -43,6 +48,10 @@ public final class EnginePackets {
                 PumpRangeRequest.TYPE,
                 PumpRangeRequest.STREAM_CODEC,
                 EnginePackets::onPumpRangeRequest);
+    }
+
+    private static void onEngineConfig(EngineConfigPayload payload, IPayloadContext ctx) {
+        ctx.enqueueWork(() -> EngineConfigClient.receive(payload.enabled()));
     }
 
     private static void onPumpRange(PumpRangePayload payload, IPayloadContext ctx) {

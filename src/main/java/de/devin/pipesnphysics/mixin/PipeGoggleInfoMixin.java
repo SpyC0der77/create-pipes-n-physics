@@ -39,9 +39,9 @@ public abstract class PipeGoggleInfoMixin extends SmartBlockEntity implements IH
     @Override
     public boolean addToGoggleTooltip(List<Component> tooltip, boolean isPlayerSneaking) {
         if (!PipesNPhysicsConfig.SHOW_PIPE_GOGGLE_INFO.get()) return false;
-        if (!PipesNPhysicsConfig.ENABLE_ENGINE.get()) return false;
         Level level = getLevel();
         if (level == null || !level.isClientSide()) return false;
+        if (!PipesNPhysicsConfig.isEngineEnabled(level)) return false;
 
         long now = level.getGameTime();
         PipeStatusClient.requestIfStale(getBlockPos(), now);

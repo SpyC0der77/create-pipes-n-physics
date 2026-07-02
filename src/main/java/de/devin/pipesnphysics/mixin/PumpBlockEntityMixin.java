@@ -67,9 +67,9 @@ public abstract class PumpBlockEntityMixin extends KineticBlockEntity {
     public boolean addToGoggleTooltip(List<Component> tooltip, boolean isPlayerSneaking) {
         boolean base = super.addToGoggleTooltip(tooltip, isPlayerSneaking);
         if (!PipesNPhysicsConfig.SHOW_PIPE_GOGGLE_INFO.get()) return base;
-        if (!PipesNPhysicsConfig.ENABLE_ENGINE.get()) return base;
         Level world = level;
         if (world == null || !world.isClientSide()) return base;
+        if (!PipesNPhysicsConfig.isEngineEnabled(world)) return base;
 
         float speed = Math.abs(getSpeed());
         if (speed <= 0.01f) return base;

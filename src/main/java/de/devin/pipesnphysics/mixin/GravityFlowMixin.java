@@ -29,10 +29,10 @@ public abstract class GravityFlowMixin extends BlockEntityBehaviour {
 
     @Inject(method = "tick", at = @At("HEAD"), cancellable = true)
     private void pipesnphysics$cancelCreateTransport(CallbackInfo ci) {
-        if (!PipesNPhysicsConfig.ENABLE_ENGINE.get()) return;
-        if (blockEntity.isVirtual()) return; // Ponder scenes & schematics keep Create's animation
         Level level = blockEntity.getLevel();
         if (level == null) return;
+        if (!PipesNPhysicsConfig.isEngineEnabled(level)) return;
+        if (blockEntity.isVirtual()) return; // Ponder scenes & schematics keep Create's animation
         if (!level.isClientSide()) {
             EngineTickHandler.markDirty(level, blockEntity.getBlockPos());
         }

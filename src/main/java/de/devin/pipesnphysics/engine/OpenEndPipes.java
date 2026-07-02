@@ -1,5 +1,6 @@
 package de.devin.pipesnphysics.engine;
 
+import com.simibubi.create.content.fluids.FluidPropagator;
 import com.simibubi.create.content.fluids.OpenEndedPipe;
 import de.devin.pipesnphysics.mixin.OpenEndedPipeAccessor;
 import net.createmod.catnip.math.BlockFace;
@@ -56,12 +57,21 @@ public final class OpenEndPipes {
 
     /** Get or create the handler for an open end discovered by the graph builder. */
     public static IFluidHandler handler(Level level, BlockPos spacePos, Direction faceTowardPipe) {
+        BlockFace face = mouthFace(level, spacePos, faceTowardPipe);
         OpenEndedPipe pipe = CACHE
                 .computeIfAbsent(level.dimension(), k -> new HashMap<>())
-                .computeIfAbsent(spacePos.immutable(), k -> new OpenEndedPipe(
-                        new BlockFace(spacePos.relative(faceTowardPipe), faceTowardPipe.getOpposite())));
+                .computeIfAbsent(spacePos.immutable(), k -> new OpenEndedPipe(face));
         pipe.manageSource(level, null);
         return pipe.provideHandler().getCapability();
+    }
+
+    /** Where the open mouth sits: on a neighbor for a normal end, on the pipe itself when waterlogged. */
+    private static BlockFace mouthFace(Level level, BlockPos spacePos, Direction faceTowardPipe) {
+        if (FluidPropagator.getPipe(level, spacePos) != null
+                && level.getBlockState(spacePos).getFluidState().isSource()) {
+            return new BlockFace(spacePos, faceTowardPipe.getOpposite());
+        }
+        return new BlockFace(spacePos.relative(faceTowardPipe), faceTowardPipe.getOpposite());
     }
 
     /**
@@ -98,5 +108,21 @@ public final class OpenEndPipes {
     public static void clear() {
         CACHE.clear();
         SPILL_TICKS.clear();
+    }
+
+    /** Drop a cached mouth and its spill timestamp (e.g. when the block at pos is edited). */
+    public static void invalidate(Level level, BlockPos spacePos) {
+        Map<BlockPos, OpenEndedPipe> pipes = CACHE.get(level.dimension());
+        if (pipes != null) pipes.remove(spacePos.immutable());
+        Map<BlockPos, Long> ticks = SPILL_TICKS.get(level.dimension());
+        if (ticks != null) ticks.remove(spacePos.immutable());
+    }
+
+    /** Invalidate pos and its six neighbors — covers mouths on either side of an edit. */
+    public static void invalidateAround(Level level, BlockPos pos) {
+        invalidate(level, pos);
+        for (Direction dir : Direction.values()) {
+            invalidate(level, pos.relative(dir));
+        }
     }
 }
