@@ -19,8 +19,8 @@ import java.util.Set;
 /**
  * Server tick driver for the engine.
  *
- * Pipes mark themselves dirty every tick (the transport-cancel mixin), so every
- * live network is seeded by all of its pipes. Three rules keep this cheap and make
+ * Pipes mark themselves dirty every tick (the transport-cancel mixin), unless the
+ * network is sleeping — then only the heartbeat re-queues them. Three rules keep this
  * each network tick exactly ONCE per server tick:
  *
  *   1. Seeds are resolved to a pipe position first ({@link GraphBuilder#findSeed}),
@@ -61,9 +61,14 @@ public final class EngineTickHandler {
 
     private EngineTickHandler() {}
 
-    /** Routine per-tick mark; honored unless the network is sleeping. */
+    /** Routine per-tick mark; skipped while the network is sleeping. */
     public static void markDirty(Level level, BlockPos pos) {
         if (level.isClientSide()) return;
+        Map<BlockPos, Long> quiet = QUIET.get(level.dimension());
+        if (quiet != null) {
+            Long sleepUntil = quiet.get(pos);
+            if (sleepUntil != null && sleepUntil > level.getGameTime()) return;
+        }
         DIRTY.computeIfAbsent(level.dimension(), k -> new HashSet<>()).add(pos.immutable());
     }
 
@@ -83,19 +88,26 @@ public final class EngineTickHandler {
 
     @SubscribeEvent
     public static void onServerTick(ServerTickEvent.Post event) {
-        if (DIRTY.isEmpty() && URGENT.isEmpty()) return;
+        if (DIRTY.isEmpty() && URGENT.isEmpty() && QUIET.isEmpty()) return;
         event.getServer().getAllLevels().forEach(EngineTickHandler::tickLevel);
     }
 
     private static void tickLevel(ServerLevel level) {
+        Map<BlockPos, Long> quiet = QUIET.computeIfAbsent(level.dimension(), k -> new HashMap<>());
+        long now = level.getGameTime();
+
+        // Re-queue sleeping cells whose heartbeat has expired.
+        Set<BlockPos> dirty = DIRTY.computeIfAbsent(level.dimension(), k -> new HashSet<>());
+        for (Map.Entry<BlockPos, Long> entry : quiet.entrySet()) {
+            if (entry.getValue() <= now) dirty.add(entry.getKey());
+        }
+
         Set<BlockPos> work = DIRTY.remove(level.dimension());
         Set<BlockPos> urgent = URGENT.remove(level.dimension());
         if (!PipesNPhysicsConfig.ENABLE_ENGINE.get()) return;
         if (work == null) work = Set.of();
         if (urgent == null) urgent = Set.of();
 
-        Map<BlockPos, Long> quiet = QUIET.computeIfAbsent(level.dimension(), k -> new HashMap<>());
-        long now = level.getGameTime();
         Set<BlockPos> covered = new HashSet<>();
 
         for (BlockPos pos : urgent) {

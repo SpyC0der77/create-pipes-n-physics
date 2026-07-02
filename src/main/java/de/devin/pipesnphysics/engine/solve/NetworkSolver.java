@@ -41,6 +41,12 @@ public final class NetworkSolver {
     /** Node count above which the iterative solver replaces Gaussian elimination. */
     private static final int DIRECT_SOLVE_LIMIT = 128;
 
+    /** When CG fails to converge, fall back to exact solve up to this size. */
+    private static final int GAUSSIAN_FALLBACK_LIMIT = 256;
+
+    /** CG iteration cap as a multiple of node count. */
+    private static final int CG_ITER_FACTOR = 50;
+
     /** Fraction of the suction limit over which crest flow tapers to zero (no cliff). */
     private static final double CREST_TAPER_FRACTION = 0.25;
 
@@ -382,9 +388,29 @@ public final class NetworkSolver {
             }
         }
 
-        return n <= DIRECT_SOLVE_LIMIT
-                ? gaussianSolve(a, rhs)
-                : conjugateGradient(a, rhs);
+        if (n <= DIRECT_SOLVE_LIMIT) {
+            return gaussianSolve(a, rhs);
+        }
+        double tolerance = cgTolerance(rhs);
+        double[] cg = conjugateGradient(a, rhs, tolerance);
+        if (residualNormSquared(a, rhs, cg) <= tolerance) {
+            return cg;
+        }
+        if (n <= GAUSSIAN_FALLBACK_LIMIT) {
+            return gaussianSolve(a, rhs);
+        }
+        return cg;
+    }
+
+    private static double cgTolerance(double[] rhs) {
+        double normSq = dot(rhs, rhs);
+        return Math.max(1.0e-18, 1.0e-12 * normSq);
+    }
+
+    private static double residualNormSquared(double[][] a, double[] rhs, double[] x) {
+        double[] residual = multiply(a, x);
+        for (int i = 0; i < residual.length; i++) residual[i] = rhs[i] - residual[i];
+        return dot(residual, residual);
     }
 
     private static double[] gaussianSolve(double[][] a, double[] rhs) {
@@ -417,15 +443,14 @@ public final class NetworkSolver {
         return x;
     }
 
-    private static double[] conjugateGradient(double[][] a, double[] rhs) {
+    private static double[] conjugateGradient(double[][] a, double[] rhs, double tolerance) {
         int n = rhs.length;
         double[] x = new double[n];
         double[] r = Arrays.copyOf(rhs, n);
         double[] p = Arrays.copyOf(rhs, n);
         double rsOld = dot(r, r);
-        double tolerance = Math.max(1.0e-18, 1.0e-16 * rsOld);
 
-        for (int iter = 0; iter < 20 * n && rsOld > tolerance; iter++) {
+        for (int iter = 0; iter < CG_ITER_FACTOR * n && rsOld > tolerance; iter++) {
             double[] ap = multiply(a, p);
             double pap = dot(p, ap);
             if (pap <= 0) break;

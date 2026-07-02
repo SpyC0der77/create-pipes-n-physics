@@ -24,7 +24,10 @@ public class FluidTankMassMixin implements BlockEntitySubLevelActor {
 
         FluidTank tank = ((FluidTankAccessor) self).pipesnphysics$getTankInventory();
         int fluidAmount = tank.getFluidAmount();
-        if (fluidAmount <= 0) return;
+        if (fluidAmount <= 0) {
+            SablePhysicsCompat.clearFluidWeight(subLevel, self.getBlockPos());
+            return;
+        }
 
         int capacity = tank.getCapacity();
         if (capacity <= 0) return;

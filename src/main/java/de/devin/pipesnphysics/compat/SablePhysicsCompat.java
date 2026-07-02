@@ -1,7 +1,7 @@
 package de.devin.pipesnphysics.compat;
 
-import de.devin.pipesnphysics.PipesNPhysics;
 import de.devin.pipesnphysics.PipesNPhysicsConfig;
+import de.devin.pipesnphysics.physics.TankMassFormulas;
 import dev.ryanhcode.sable.api.physics.mass.MassTracker;
 import dev.ryanhcode.sable.companion.math.Pose3dc;
 import dev.ryanhcode.sable.sublevel.ServerSubLevel;
@@ -17,36 +17,52 @@ import java.util.Map;
 public class SablePhysicsCompat {
 
     private static final Map<String, Double> lastAppliedMass = new HashMap<>();
+    private static final Map<String, Vec3> lastAppliedOffset = new HashMap<>();
 
     public static void applyFluidWeight(ServerSubLevel subLevel, BlockPos controllerPos,
                                         int width, int height, double fillFraction,
                                         double massKg, double timeStep) {
-        if (massKg <= 0) return;
+        if (massKg <= 0) {
+            clearFluidWeight(subLevel, controllerPos);
+            return;
+        }
 
         if (PipesNPhysicsConfig.EXPERIMENTAL_TANK_COG.get()) {
             applyViaMassTracker(subLevel, controllerPos, fillFraction, massKg);
         } else {
-            applyViaForce(subLevel, massKg);
+            applyViaForce(subLevel, massKg, timeStep);
         }
     }
 
-    private static void applyViaForce(ServerSubLevel subLevel, double massKg) {
+    /** Remove any fluid mass previously applied to this tank controller. */
+    public static void clearFluidWeight(ServerSubLevel subLevel, BlockPos controllerPos) {
+        if (PipesNPhysicsConfig.EXPERIMENTAL_TANK_COG.get()) {
+            clearViaMassTracker(subLevel, controllerPos);
+        }
+    }
+
+    public static void clear() {
+        lastAppliedMass.clear();
+        lastAppliedOffset.clear();
+    }
+
+    private static void applyViaForce(ServerSubLevel subLevel, double massKg, double timeStep) {
         SubLevelPhysicsSystem system = SubLevelPhysicsSystem.get(subLevel.getLevel());
         if (system == null) return;
         var pipeline = system.getPipeline();
         if (pipeline == null) return;
 
-        Vector3d force = new Vector3d(0, -massKg, 0);
-        pipeline.applyLinearAndAngularImpulse(subLevel, force, new Vector3d(0, 0, 0), true);
+        double impulseY = TankMassFormulas.gravityImpulseY(massKg, timeStep);
+        Vector3d impulse = new Vector3d(0, impulseY, 0);
+        pipeline.applyLinearAndAngularImpulse(subLevel, impulse, new Vector3d(0, 0, 0), true);
     }
 
-    private static final Map<String, Vec3> lastAppliedOffset = new HashMap<>();
-
-    private static void applyViaMassTracker(ServerSubLevel subLevel, BlockPos controllerPos, double fillFraction, double massKg) {
+    private static void applyViaMassTracker(ServerSubLevel subLevel, BlockPos controllerPos,
+                                            double fillFraction, double massKg) {
         MassTracker tracker = subLevel.getSelfMassTracker();
         if (tracker == null) return;
 
-        String key = subLevel.getUniqueId() + ":" + controllerPos.toShortString();
+        String key = massKey(subLevel, controllerPos);
         Vec3 offset = tiltAwareOffset(subLevel, fillFraction);
 
         Double prevMass = lastAppliedMass.get(key);
@@ -67,6 +83,36 @@ public class SablePhysicsCompat {
         } catch (Exception e) {
             return;
         }
+    }
+
+    private static void clearViaMassTracker(ServerSubLevel subLevel, BlockPos controllerPos) {
+        String key = massKey(subLevel, controllerPos);
+        Double prevMass = lastAppliedMass.remove(key);
+        if (prevMass == null || prevMass <= 0) {
+            lastAppliedOffset.remove(key);
+            return;
+        }
+
+        MassTracker tracker = subLevel.getSelfMassTracker();
+        if (tracker == null) {
+            lastAppliedOffset.remove(key);
+            return;
+        }
+
+        try {
+            var level = subLevel.getLevel();
+            BlockState state = level.getBlockState(controllerPos);
+            Vec3 prevOffset = lastAppliedOffset.getOrDefault(key, new Vec3(0.5, 0.5, 0.5));
+            tracker.addBlockMass(level, state, controllerPos, -prevMass, prevOffset);
+        } catch (Exception e) {
+            return;
+        } finally {
+            lastAppliedOffset.remove(key);
+        }
+    }
+
+    private static String massKey(ServerSubLevel subLevel, BlockPos controllerPos) {
+        return subLevel.getUniqueId() + ":" + controllerPos.toShortString();
     }
 
     private static Vec3 tiltAwareOffset(ServerSubLevel subLevel, double fillFraction) {

@@ -5,6 +5,7 @@ import com.simibubi.create.foundation.item.ItemDescription;
 import com.simibubi.create.foundation.item.KineticStats;
 import com.simibubi.create.foundation.item.TooltipModifier;
 import de.devin.pipesnphysics.compat.SableCompat;
+import de.devin.pipesnphysics.compat.SablePhysicsCompat;
 import de.devin.pipesnphysics.engine.EngineTickHandler;
 import de.devin.pipesnphysics.engine.OpenEndPipes;
 import de.devin.pipesnphysics.engine.command.PipeGraphCommand;
@@ -51,6 +52,7 @@ public class PipesNPhysics {
                 PipeGraphCommand.register(event.getDispatcher()));
         NeoForge.EVENT_BUS.addListener((ServerStoppedEvent event) -> {
             SableCompat.clearCaches();
+            SablePhysicsCompat.clear();
             EngineTickHandler.clear();
             OpenEndPipes.clear();
         });

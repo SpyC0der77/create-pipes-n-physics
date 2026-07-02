@@ -14,8 +14,10 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Cancels Create's fluid transport tick on every pipe while the engine is enabled,
- * and marks the network as dirty so the engine picks it up on the next server tick.
+ * Cancels Create's fluid transport tick on every pipe while the engine is enabled.
+ * On the server, marks the network dirty so the engine picks it up on the next tick
+ * — unless the network is sleeping, in which case {@link EngineTickHandler#markDirty}
+ * is a no-op and the heartbeat alone re-queues it.
  *
  * The cancel happens on both server and client so Create's pressure propagation and
  * flow creation don't fight the engine. The one piece we KEEP is
