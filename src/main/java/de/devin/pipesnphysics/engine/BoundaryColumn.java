@@ -46,12 +46,13 @@ public final class BoundaryColumn {
     private static final int OPEN_END_CAPACITY_MB = 4_000_000;
 
     /**
-     * Capacity stand-in for a hose pulley drawing from a fluid body: large enough that
-     * its head holds steady within a tick (the pulley lifts water to its own level under
-     * kinetic power, so it reads as a brimming reservoir at the pulley), while the actual
-     * per-tick volume is still clamped by what Create's drainer will hand over.
+     * Capacity stand-in for a hose pulley bridging the pipe network to a world fluid body:
+     * large enough that its head holds steady within a tick (the pulley lifts / deposits at
+     * its own level under kinetic power, so it reads as a fixed reservoir at the pulley),
+     * while the actual per-tick volume is still clamped by what Create's drainer hands over
+     * (as a brimming SOURCE) or filler accepts (as a bottomless SINK).
      */
-    private static final int PULLEY_SOURCE_CAPACITY_MB = 4_000_000;
+    private static final int PULLEY_CAPACITY_MB = 4_000_000;
 
     private final BlockPos identity;
     private final BlockPos accessPos;
@@ -62,11 +63,16 @@ public final class BoundaryColumn {
     private final int contentMb;
     private final Direction openFace;
     private final boolean infiniteSource;
+    private final boolean finiteReservoir;
+    private final double fillScale;
     private final List<Integer> memberNodes = new ArrayList<>();
+    /** Face to resolve/transfer a SIDE-SPECIFIC handler through; null = side-agnostic (use {@code null} side). */
+    private Direction accessFace;
 
     private BoundaryColumn(BlockPos identity, BlockPos accessPos, double baseY,
                            int heightBlocks, int capacityMb, FluidStack contents, int contentMb,
-                           Direction openFace, boolean infiniteSource) {
+                           Direction openFace, boolean infiniteSource, boolean finiteReservoir,
+                           double fillScale) {
         this.identity = identity;
         this.accessPos = accessPos;
         this.baseY = baseY;
@@ -76,20 +82,63 @@ public final class BoundaryColumn {
         this.contentMb = contentMb;
         this.openFace = openFace;
         this.infiniteSource = infiniteSource;
+        this.finiteReservoir = finiteReservoir;
+        this.fillScale = fillScale;
     }
 
     /**
-     * Find the fluid capability at a position, preferring the side-agnostic handler
-     * and falling back to any side a side-sensitive block exposes.
+     * Drain a SPECIFIC fluid, tolerant of handlers that only implement the amount-based drain.
+     * NeoForge's {@code IFluidHandler} has two drains: {@code drain(FluidStack)} (this exact fluid) and
+     * {@code drain(int)} (any fluid up to an amount). Some handlers override only the amount variant and
+     * leave {@code drain(FluidStack)} on the {@code FluidTank} template default, which reads an unrelated
+     * internal field and returns EMPTY — create-aeronautics' docking-connector wrapper does exactly this,
+     * so it reads drainable through the int API (and to Create) but not through the fluid API we use, and
+     * the solver saw it as an undrainable source (a SOURCE_DRY stall). Try the fluid variant first; if it
+     * gives nothing, fall back to the amount variant but accept the result ONLY when it is the fluid we
+     * asked for, so a different fluid is never drained. A correct handler never reaches the fallback.
+     */
+    public static FluidStack drainMatching(IFluidHandler handler, FluidStack wanted, FluidAction action) {
+        FluidStack drained = handler.drain(wanted, action);
+        if (!drained.isEmpty()) return drained;
+        FluidStack byAmount = handler.drain(wanted.getAmount(), action);
+        return FluidStack.isSameFluidSameComponents(byAmount, wanted) ? byAmount : FluidStack.EMPTY;
+    }
+
+    /**
+     * Find the fluid capability at a position: the side-agnostic ({@code null}) handler first, then —
+     * for a SIDE-SPECIFIC block that exposes no {@code null} handler — a face that a pipe/pump actually
+     * connects on, and only then any remaining face. Preferring a connecting face means a block that
+     * exposes DIFFERENT handlers per side (an input tank on one face, an output on another) is read
+     * through the face the network is plumbed into, not an arbitrary side. It is derived purely from
+     * world geometry, so the solve and the later {@code apply} resolve the SAME handler with nothing
+     * threaded between them. (This does NOT yet let one block serve two different fluids on two faces at
+     * once — that needs per-face endpoints; it only fixes reading through the wrong side.)
      */
     public static IFluidHandler findHandler(Level level, BlockPos pos) {
+        return findHandler(level, pos, null);
+    }
+
+    /**
+     * Find the fluid capability, resolving a SIDE-SPECIFIC handler through a specific {@code face} when
+     * given (the face the network connects on, from {@link Node#accessFace}). A handler that exposes a
+     * DIFFERENT tank per side is then read through the correct one. {@code face == null} is the ordinary
+     * side-agnostic resolution ({@code null} side, then a connecting face, then any).
+     */
+    public static IFluidHandler findHandler(Level level, BlockPos pos, Direction face) {
+        if (face != null) {
+            IFluidHandler sided = level.getCapability(Capabilities.FluidHandler.BLOCK, pos, face);
+            if (sided != null) return sided;
+        }
         IFluidHandler cap = level.getCapability(Capabilities.FluidHandler.BLOCK, pos, null);
         if (cap != null) return cap;
+        IFluidHandler anyFace = null;
         for (Direction side : Direction.values()) {
             cap = level.getCapability(Capabilities.FluidHandler.BLOCK, pos, side);
-            if (cap != null) return cap;
+            if (cap == null) continue;
+            if (FluidPropagator.getPipe(level, pos.relative(side)) != null) return cap; // a connecting face
+            if (anyFace == null) anyFace = cap;
         }
-        return null;
+        return anyFace;
     }
 
     /**
@@ -98,39 +147,62 @@ public final class BoundaryColumn {
      */
     public static BoundaryColumn resolve(Level level, Node handlerNode) {
         BlockPos pos = handlerNode.pos();
-        IFluidHandler cap = findHandler(level, pos);
+        Direction face = handlerNode.accessFace(); // side-specific handler face, or null
+        IFluidHandler cap = findHandler(level, pos, face);
         if (cap == null) return null;
+
+        // A relay endpoint (a docking connector, a hose) moves fluid through its own logic, so modelling
+        // its tiny buffer as a surface-elevation capacitor makes the solver call it "balanced" and refuse
+        // to drain it (the equalization stall). Resolve it drain-priority and bottomless instead — exactly
+        // like a hose pulley — so it is a one-way SOURCE while it holds fluid and a one-way SINK while
+        // empty. See HandlerRoles#isRelayEndpoint.
+        if (HandlerRoles.isRelayEndpoint(level, pos)) return relayEndpoint(level, pos, cap);
 
         if (level.getBlockEntity(pos) instanceof FluidTankBlockEntity tankBe) {
             FluidTankBlockEntity controller = tankBe.getControllerBE();
             if (controller == null) return null; // multiblock mid-assembly or controller unloaded
             FluidTank inventory = controller.getTankInventory();
             int height = ((FluidTankAccessor) (Object) controller).pipesnphysics$getHeight();
+            int width = ((FluidTankAccessor) (Object) controller).pipesnphysics$getWidth();
+            BlockPos controllerPos = controller.getBlockPos();
             FluidStack fluid = inventory.getFluid();
             return new BoundaryColumn(
-                    controller.getBlockPos(), pos,
-                    SableCompat.getWorldY(level, controller.getBlockPos()) - 0.5,
-                    height, inventory.getCapacity(), fluid.copy(), fluid.getAmount(), null, false);
+                    controllerPos, pos,
+                    SableCompat.getColumnBaseY(level, controllerPos, width, height),
+                    height, inventory.getCapacity(), fluid.copy(), fluid.getAmount(), null, false, true,
+                    SableCompat.getUpProjectionY(level, controllerPos));
         }
 
-        // A hose pulley draws from a fluid body through its hose: when its handler
-        // advertises a drainable world fluid, model it as a brimming, one-way source
-        // at the pulley's elevation rather than its tiny 1,500 mB buffer. The buffer
-        // would equalize and stall like any small reservoir, and its opening lip would
-        // gate the draw depending on where the pipe meets the pulley. Create's drainer
-        // clamps the real per-tick volume and its counterpart bookkeeping stops the
-        // pulley from reclaiming fluid it just deposited, so a one-way source is safe.
-        // No drainable fluid (pulley over air, or filling) falls through to the generic
-        // handler path below, where the buffer behaves as an ordinary fill sink.
+        // A hose pulley bridges the pipe network to a world fluid body through its hose.
+        // Model it as a fixed reservoir at the pulley's elevation rather than its tiny
+        // 1,500 mB buffer — the buffer would equalize and stall like any small reservoir,
+        // and its opening lip would gate flow by where the pipe meets the pulley. Create's
+        // drainer/filler clamps the real per-tick volume either way.
+        //
+        // DRAIN-PRIORITY: when its handler advertises a drainable body, it is a brimming,
+        // one-way SOURCE (draw a lake, unchanged). Otherwise it is a bottomless, one-way
+        // SINK — the network pushes fluid out through it and Create deposits it into the
+        // world (the "can't push out of a pulley" gap). A pulley that JUST deposited is
+        // held as a sink for a cooldown even though its fresh block now reads drainable:
+        // without that latch drain-priority would flip it to a source and suck its own
+        // output straight back (the reclaim oscillation, the same class the open-end spill
+        // latch guards). Create's own counterpart bookkeeping only softens this; the latch
+        // is what actually holds the direction.
         if (isHosePulley(level, pos)) {
             FluidStack drainable = cap.getFluidInTank(0);
-            if (!drainable.isEmpty()
-                    && !cap.drain(drainable.copyWithAmount(1), FluidAction.SIMULATE).isEmpty()) {
+            boolean drainableBody = !drainable.isEmpty()
+                    && !cap.drain(drainable.copyWithAmount(1), FluidAction.SIMULATE).isEmpty();
+            boolean depositing = OpenEndPipes.pulleyRecentlyDeposited(level, pos,
+                    PipesNPhysicsConfig.OPEN_END_INTAKE_COOLDOWN_TICKS.get());
+            if (drainableBody && !depositing) {
                 return new BoundaryColumn(pos, pos,
-                        SableCompat.getWorldY(level, pos) - 0.5, 1, PULLEY_SOURCE_CAPACITY_MB,
-                        drainable.copyWithAmount(PULLEY_SOURCE_CAPACITY_MB),
-                        PULLEY_SOURCE_CAPACITY_MB, null, true);
+                        SableCompat.getWorldY(level, pos) - 0.5, 1, PULLEY_CAPACITY_MB,
+                        drainable.copyWithAmount(PULLEY_CAPACITY_MB),
+                        PULLEY_CAPACITY_MB, null, true, false, 1.0);
             }
+            return new BoundaryColumn(pos, pos,
+                    SableCompat.getWorldY(level, pos) - 0.5, 1, PULLEY_CAPACITY_MB,
+                    FluidStack.EMPTY, 0, null, false, false, 1.0);
         }
 
         int capacity = 0;
@@ -149,13 +221,35 @@ public final class BoundaryColumn {
         }
         if (capacity <= 0) return null;
 
+        // Only the generic path can be a side-specific handler (a tank/pulley/relay is side-agnostic),
+        // so this is where the access face rides onto the column for the later transfer.
         return new BoundaryColumn(pos, pos,
-                SableCompat.getWorldY(level, pos) - 0.5, 1, capacity, found, amount, null, false);
+                SableCompat.getColumnBaseY(level, pos, 1, 1), 1, capacity, found, amount, null, false, true,
+                SableCompat.getUpProjectionY(level, pos)).accessFace(face);
     }
 
     /** A Create hose pulley block, whose handler drains/fills a world fluid body. */
     private static boolean isHosePulley(Level level, BlockPos pos) {
         return level.getBlockEntity(pos) instanceof HosePulleyBlockEntity;
+    }
+
+    /**
+     * A relay endpoint (docking connector, hose) as a drain-priority bottomless column at its own
+     * elevation — the hose-pulley model applied to any relay handler. When it can give fluid
+     * ({@code drain} SIMULATE) it is a brimming one-way SOURCE; otherwise a bottomless, one-way, empty
+     * SINK. Either way it is NOT a finite reservoir, so it never surface-equalizes or lip-gates — the
+     * engine drains a receiving connector and fills a sending one on demand, and the real per-tick
+     * volume is clamped later by the handler's own drain/fill (which enforces the mod's pairing gate).
+     */
+    private static BoundaryColumn relayEndpoint(Level level, BlockPos pos, IFluidHandler cap) {
+        double baseY = SableCompat.getWorldY(level, pos) - 0.5;
+        FluidStack drainable = cap.drain(Integer.MAX_VALUE, FluidAction.SIMULATE);
+        if (!drainable.isEmpty()) {
+            return new BoundaryColumn(pos, pos, baseY, 1, PULLEY_CAPACITY_MB,
+                    drainable.copyWithAmount(PULLEY_CAPACITY_MB), PULLEY_CAPACITY_MB, null, true, false, 1.0);
+        }
+        return new BoundaryColumn(pos, pos, baseY, 1, PULLEY_CAPACITY_MB,
+                FluidStack.EMPTY, 0, null, false, false, 1.0);
     }
 
     /**
@@ -192,47 +286,58 @@ public final class BoundaryColumn {
         // over-reports a partial body, which would otherwise duplicate a few mB).
         return new BoundaryColumn(space, space, bottom, 1, OPEN_END_CAPACITY_MB,
                 canIntake ? intake : FluidStack.EMPTY,
-                canIntake ? intake.getAmount() : 0, openEndNode.openFace(), canIntake);
+                canIntake ? intake.getAmount() : 0, openEndNode.openFace(), canIntake, false, 1.0);
     }
 
     /**
-     * The world fluid an open mouth may draw IN, or EMPTY to keep it a one-way spill
-     * outlet. Eligible bodies:
-     *   - residual already pulled into the pipe's buffer (a partly-delivered draw);
-     *   - a cauldron / honey block, which drains to a clean empty state;
-     *   - a self-regenerating fluid source (a lake), tested with Create's OWN refill check
-     *     ({@code getNewLiquid} on the drained-to-14 state equals the source — the exact
-     *     discriminator {@code OpenEndedPipe} uses) — always drinkable, on the main level
-     *     or projected onto a world lake from a Sable sub-level;
-     *   - ANY other source (a finite / hand-placed block) on the MAIN level, UNLESS the
-     *     network recently spilled or the block is {@link #contested} between two mouths.
-     *     Finite intake is off on Sable sub-levels (the projected coords break the contested
-     *     scan and the sub-level spill mixin preserves rather than consumes a source).
+     * The fluid an open mouth may draw IN, or EMPTY to keep it a one-way spill outlet. Checks the
+     * block the pipe faces on its OWN level FIRST — a main-level source, or one placed on a Sable
+     * sub-level (at its plot coords) — then, for a contraption mouth hovering over the host world, the
+     * PROJECTED world block (mirroring spill, which goes to the world); and finally, when
+     * {@code ENABLE_CROSS_LEVEL_PIPING} is on, the corresponding block on any OTHER Sable level
+     * whose bounds overlap the mouth (ship A drinking a source on ship B, or a contraption over the
+     * dimension, or the dimension over a contraption). Residual already
+     * pulled into the pipe's buffer short-circuits everything. Finite intake works on sub-levels and
+     * across contraptions too: the drain (OpenEndedPipeMixin) consumes a finite source and leaves a
+     * lake, so it can no longer mint fluid.
      */
     private static FluidStack intakeFluid(Level level, BlockPos space, boolean networkSpilled) {
         if (!PipesNPhysicsConfig.ENABLE_OPEN_END_INTAKE.get()) return FluidStack.EMPTY;
         FluidStack residual = OpenEndPipes.bufferedIntake(level, space);
         if (!residual.isEmpty()) return residual;
+        FluidStack local = drinkableSource(level, space, networkSpilled);
+        if (!local.isEmpty()) return local;
         BlockPos out = worldOutputPos(level, space);
-        BlockState state = level.getBlockState(out);
-        FluidStack drainable = VanillaFluidTargets.drainBlock(level, out, state, true);
+        if (!out.equals(space)) {
+            FluidStack world = drinkableSource(level, out, networkSpilled);
+            if (!world.isEmpty()) return world;
+        }
+        if (PipesNPhysicsConfig.ENABLE_CROSS_LEVEL_PIPING.get()) {
+            FluidStack other = SableCompat.atOverlappingContraptions(level, space, (l, p) -> {
+                FluidStack found = drinkableSource(l, p, networkSpilled);
+                return found.isEmpty() ? null : found; // null keeps Sable's traversal searching
+            });
+            if (other != null) return other;
+        }
+        return FluidStack.EMPTY;
+    }
+
+    /**
+     * The fluid drinkable from the block at {@code pos}, or EMPTY: a cauldron/honey block; a
+     * self-regenerating lake (Create's own {@code getNewLiquid}-on-drained-to-14 discriminator); or a
+     * finite/hand-placed source — the last one UNLESS the network recently spilled (its own spit) or the
+     * block is {@link #contested} between two mouths (a broken run's gap, which drinking teleports across).
+     */
+    private static FluidStack drinkableSource(Level level, BlockPos pos, boolean networkSpilled) {
+        BlockState state = level.getBlockState(pos);
+        FluidStack drainable = VanillaFluidTargets.drainBlock(level, pos, state, true);
         if (!drainable.isEmpty()) return drainable;
         FluidState fluidState = state.getFluidState();
         if (!fluidState.isSource()) return FluidStack.EMPTY;
-        if (survivesDrain(level, out, fluidState)) {
-            return new FluidStack(fluidState.getType(), 1000); // a lake — always drinkable
+        if (survivesDrain(level, pos, fluidState)) {
+            return new FluidStack(fluidState.getType(), 1000);
         }
-        // A finite/hand-placed source: pull it, UNLESS
-        //   - this network spilled recently (could be sucking its own spit back), or
-        //   - the block is wedged between two pipe mouths — a broken run's spill, drinking
-        //     which would teleport fluid across the gap, or
-        //   - the mouth is on a Sable sub-level (out != space): the projection breaks the
-        //     contested scan, and the sub-level spill mixin PRESERVES a drained source
-        //     rather than consuming it, so a finite block there would mint infinite fluid.
-        //     Lakes are handled above (survivesDrain reads the real world block), so a
-        //     contraption pipe dipped in a world lake still works.
-        boolean projected = !out.equals(space);
-        if (!projected && !networkSpilled && !contested(level, out)) {
+        if (!networkSpilled && !contested(level, pos)) {
             return new FluidStack(fluidState.getType(), 1000);
         }
         return FluidStack.EMPTY;
@@ -277,12 +382,20 @@ public final class BoundaryColumn {
         return projected.equals(space) ? space : projected;
     }
 
-    /** The live handler that can give or take this column's fluid. */
+    /** The live handler that can give or take this column's fluid (through its side-specific face if any). */
     public IFluidHandler handler(Level level) {
         return isOpenEnd()
                 ? OpenEndPipes.handler(level, accessPos, openFace)
-                : findHandler(level, accessPos);
+                : findHandler(level, accessPos, accessFace);
     }
+
+    private BoundaryColumn accessFace(Direction face) {
+        this.accessFace = face;
+        return this;
+    }
+
+    /** The face a side-specific handler is resolved/transferred through, or null for side-agnostic. */
+    public Direction accessFace() { return accessFace; }
 
     public boolean isOpenEnd() { return openFace != null; }
 
@@ -307,6 +420,9 @@ public final class BoundaryColumn {
 
     public double baseY() { return baseY; }
 
+    /** Scale on the fill height (cos of the sub-level tilt): fluid rises along local-up, not world-up. */
+    public double fillScale() { return fillScale; }
+
     public int heightBlocks() { return heightBlocks; }
 
     public int capacityMb() { return capacityMb; }
@@ -319,6 +435,15 @@ public final class BoundaryColumn {
     public List<Integer> memberNodes() { return memberNodes; }
 
     public boolean isEmpty() { return contents.isEmpty() || contentMb <= 0; }
+
+    /**
+     * A real finite tank/basin/machine, as opposed to an atmospheric boundary (open end) or a
+     * world-body bridge (hose pulley). Only these carry a capacity CEILING that the solver saturates
+     * against, so a full one is clamped GIVE-ONLY (the box-constrained dual of the empty→receive-only
+     * wall). Boundaries keep their own one-way rules (infinite-source pin, empty→receive) and are
+     * left unbounded; they never sit "at capacity" as a finite reservoir does.
+     */
+    public boolean isFiniteReservoir() { return finiteReservoir; }
 
     public double fillFraction() {
         return capacityMb > 0 ? (double) contentMb / capacityMb : 0;

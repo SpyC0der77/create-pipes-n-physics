@@ -38,6 +38,9 @@ public final class NetworkSolver {
     /** Flows smaller than this (mB/tick) are treated as zero for constraint checks. */
     private static final double FLOW_TOLERANCE = 1.0e-7;
 
+    /** Head overshoot past a box bound (blocks) below which a node is NOT counted saturated. */
+    private static final double SATURATION_TOLERANCE = 1.0e-6;
+
     /** Node count above which the iterative solver replaces Gaussian elimination. */
     private static final int DIRECT_SOLVE_LIMIT = 128;
 
@@ -68,11 +71,27 @@ public final class NetworkSolver {
     /**
      * One node of the solver network.
      *
+     * <p>A reservoir carries box limits on its end-of-tick head: {@code floor} (the head
+     * when empty) and {@code ceiling} (the head when full). The active-set loop treats a
+     * capacitor whose solved head would cross a bound as SATURATED and constrains its
+     * branches — a full column may only GIVE, an empty one may only RECEIVE — so no
+     * fictitious flow is routed into a full tank or out of an empty one. Junctions/pumps
+     * (zero capacitance) and boundaries that manage their own one-way rules pass the
+     * unbounded {@code (capacitance, head)} constructor, which leaves the box wide open
+     * ({@code ±∞}) so the solve is byte-for-byte the plain linear step it was before.
+     *
      * @param capacitance mB of volume per block of head; 0 for junctions and pumps
      * @param head        current head in blocks (fluid surface height for reservoirs;
      *                    ignored as input for zero-capacitance nodes)
+     * @param floor       head at empty; the lower box bound (may be {@code -∞})
+     * @param ceiling     head at full; the upper box bound (may be {@code +∞})
      */
-    public record NodeSpec(double capacitance, double head) {}
+    public record NodeSpec(double capacitance, double head, double floor, double ceiling) {
+        /** An unbounded node (junction, pump, or a reservoir whose saturation is handled elsewhere). */
+        public NodeSpec(double capacitance, double head) {
+            this(capacitance, head, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY);
+        }
+    }
 
     /**
      * One branch of the solver network.
@@ -102,9 +121,13 @@ public final class NetworkSolver {
      * @param backflowBlocked branches deactivated because the net potential opposed
      *                        their one-way direction; on a pump's EMF branch this
      *                        means exactly "the opposing head exceeds the pump head"
+     * @param saturation      per node: +1 a full reservoir clamped to give-only, -1 an
+     *                        empty one clamped to receive-only, 0 free (junctions/pumps
+     *                        and unbounded reservoirs are always 0)
      */
     public record Result(double[] heads, double[] flows, double[] netInflow,
-                         boolean[] active, boolean[] crestBlocked, boolean[] backflowBlocked) {}
+                         boolean[] active, boolean[] crestBlocked, boolean[] backflowBlocked,
+                         int[] saturation) {}
 
     /**
      * Advance the network by one tick of length {@code dt}.
@@ -128,7 +151,9 @@ public final class NetworkSolver {
 
         double[] flows = new double[m];
         boolean[] backflowBlocked = new boolean[m];
-        double[] heads = runActiveSet(nodes, branches, active, gateScale, flows, backflowBlocked, dt);
+        int[] saturation = new int[n];
+        double[] heads = runActiveSet(nodes, branches, active, gateScale, saturation,
+                flows, backflowBlocked, dt);
 
         // Crest (siphon/cavitation) gating is evaluated exactly ONCE against the
         // ungated solution, then frozen for a final pass. Re-evaluating it against
@@ -161,7 +186,22 @@ public final class NetworkSolver {
             }
         }
         if (gated) {
-            heads = runActiveSet(nodes, branches, active, gateScale, flows, backflowBlocked, dt);
+            // The pre-crest solve's one-way deactivations were computed against phantom flow through
+            // crest-broken branches carrying FULL conductance — a crest-broken feeder's pre-gate
+            // pressure can backflow-block a working pump. Once the gate removes that feeder the pump
+            // would deliver, so rebuild the active set from scratch (conductance-valid minus the frozen
+            // crest-blocked branches) and clear the one-way flags before re-solving. gateScale and
+            // crestBlocked stay frozen, so the crest gate remains one-shot; the re-run is still monotone.
+            for (int e = 0; e < m; e++) {
+                BranchSpec br = branches.get(e);
+                active[e] = br.conductance() > 0 && br.a() != br.b()
+                        && br.a() >= 0 && br.a() < n && br.b() >= 0 && br.b() < n
+                        && !crestBlocked[e];
+            }
+            Arrays.fill(backflowBlocked, false);
+            Arrays.fill(saturation, 0);
+            heads = runActiveSet(nodes, branches, active, gateScale, saturation,
+                    flows, backflowBlocked, dt);
         }
 
         double[] netInflow = new double[n];
@@ -172,50 +212,125 @@ public final class NetworkSolver {
             netInflow[br.b()] += flows[e] * dt;
         }
 
-        return new Result(heads, flows, netInflow, active, crestBlocked, backflowBlocked);
+        return new Result(heads, flows, netInflow, active, crestBlocked, backflowBlocked, saturation);
     }
 
     /**
-     * Solve heads and flows, deactivating one-way (check valve) violators and
-     * re-solving until consistent. Deactivation is monotone, so this terminates in
-     * at most |branches| rounds.
+     * Solve heads and flows under BOTH the static one-way constraints (check valves,
+     * pumps, lips) and the dynamic capacity box: solve, then
+     * <ul>
+     *   <li>deactivate any branch whose flow opposes its EFFECTIVE one-way sign
+     *       (static sign combined with the saturation of its endpoints), and</li>
+     *   <li>clamp any free reservoir whose solved head crossed a box bound — a node
+     *       over its ceiling becomes {@code +1} (full → give-only), one under its floor
+     *       {@code -1} (empty → receive-only).</li>
+     * </ul>
+     * re-solving until no branch changes. Deactivation is MONOTONE — a branch is only ever
+     * dropped, never restored — so the loop terminates in at most {@code |branches|} rounds.
+     *
+     * <p>Saturation is seeded ONCE from the START-of-tick heads: a reservoir sitting at (or
+     * past) a box bound before the step is clamped, one with room is not. The end-of-tick
+     * head legitimately overshoots a bound within a single implicit-Euler step (a near-full
+     * tank a strong pump fills past 100% this tick); the transfer layer clamps that MAGNITUDE
+     * to the real remaining room, so walling on the solved overshoot would freeze a tank
+     * short of full forever. Direction is the solver's job, magnitude the transfer layer's.
+     *
+     * <p>The saturation constraint is a per-BRANCH direction wall, not a head clamp on the
+     * node: fixing a full node's head and letting the QP REJECT the surplus inflow would be
+     * non-conservative — it lets an upstream tank bleed into a full sink instead of backing
+     * up. Blocking the branch is what makes the fluid back up into a reservoir with room.
+     * When both endpoints' saturation demand OPPOSITE directions on one branch (two full
+     * ends facing each other, or a full end whose only opening rises above its waterline)
+     * the branch is a DEAD CONDUIT: zero conductance, no flow either way, but left in the
+     * component so it neither circulates fluid nor starves an upstream reservoir.
      */
     private static double[] runActiveSet(List<NodeSpec> nodes, List<BranchSpec> branches,
-                                         boolean[] active, double[] gateScale,
+                                         boolean[] active, double[] gateScale, int[] saturation,
                                          double[] flows, boolean[] backflowBlocked, double dt) {
+        int n = nodes.size();
         int m = branches.size();
-        double[] heads = new double[nodes.size()];
+        double[] heads = new double[n];
+        double[] roundScale = new double[m];
+        int[] effSign = new int[m];
+
+        for (int i = 0; i < n; i++) {
+            NodeSpec node = nodes.get(i);
+            if (node.capacitance() <= 0) continue;
+            if (node.head() >= node.ceiling() - SATURATION_TOLERANCE) saturation[i] = +1;
+            else if (node.head() <= node.floor() + SATURATION_TOLERANCE) saturation[i] = -1;
+        }
 
         for (int round = 0; round <= m; round++) {
+            // Fold each endpoint's saturation into an effective one-way sign; a contradiction
+            // makes the branch a dead conduit (zero conductance) for this round.
+            for (int e = 0; e < m; e++) {
+                if (!active[e]) { roundScale[e] = 0; effSign[e] = 0; continue; }
+                BranchSpec br = branches.get(e);
+                int es = effectiveSign(br.allowedSign(), saturation[br.a()], saturation[br.b()]);
+                if (es == Integer.MIN_VALUE) {
+                    roundScale[e] = 0;   // dead conduit: carries no flow, stays in the component
+                    effSign[e] = 0;
+                } else {
+                    roundScale[e] = gateScale[e];
+                    effSign[e] = es;
+                }
+            }
+
             pruneCapacitanceFreeComponents(nodes, branches, active);
 
-            heads = solveHeads(nodes, branches, active, gateScale, dt);
+            heads = solveHeads(nodes, branches, active, roundScale, dt);
 
             boolean changed = false;
             for (int e = 0; e < m; e++) {
-                if (!active[e]) {
+                if (!active[e] || roundScale[e] == 0) {
                     flows[e] = 0;
                     continue;
                 }
                 BranchSpec br = branches.get(e);
-                double q = gateScale[e] * br.conductance()
+                double q = roundScale[e] * br.conductance()
                         * (heads[br.a()] - heads[br.b()] + br.emf());
                 flows[e] = q;
 
-                if (violatesDirection(br, q)) {
+                if (violatesDirection(effSign[e], q)) {
                     active[e] = false;
                     backflowBlocked[e] = true;
                     flows[e] = 0;
                     changed = true;
                 }
             }
+
             if (!changed) break;
         }
         return heads;
     }
 
-    private static boolean violatesDirection(BranchSpec br, double flow) {
-        return br.allowedSign() != 0 && flow * br.allowedSign() < -FLOW_TOLERANCE;
+    private static boolean violatesDirection(int allowedSign, double flow) {
+        return allowedSign != 0 && flow * allowedSign < -FLOW_TOLERANCE;
+    }
+
+    /**
+     * A branch's one-way sign after combining its static constraint with the saturation
+     * of each endpoint, or {@link Integer#MIN_VALUE} when the two disagree (a dead conduit).
+     * A full node ({@code +1}) may only GIVE — flow OUT of it; an empty node ({@code -1})
+     * may only RECEIVE — flow INTO it. Flow OUT of endpoint {@code a} is {@code a→b} ({@code +1}),
+     * out of {@code b} is {@code b→a} ({@code -1}).
+     */
+    private static int effectiveSign(int staticSign, int satA, int satB) {
+        int sign = combineSign(staticSign, inducedSign(satA, true));
+        return combineSign(sign, inducedSign(satB, false));
+    }
+
+    private static int inducedSign(int saturation, boolean atA) {
+        if (saturation == 0) return 0;
+        int outward = atA ? +1 : -1;                  // sign of "flow leaves this endpoint"
+        return saturation > 0 ? outward : -outward;   // full gives (outward), empty receives (inward)
+    }
+
+    /** Intersect two one-way signs, or {@link Integer#MIN_VALUE} if they contradict. */
+    private static int combineSign(int current, int wanted) {
+        if (wanted == 0) return current;
+        if (current == 0 || current == wanted) return wanted;
+        return Integer.MIN_VALUE;
     }
 
     /**
@@ -311,38 +426,25 @@ public final class NetworkSolver {
                                                        List<BranchSpec> branches,
                                                        boolean[] active) {
         int n = nodes.size();
-        int[] parent = new int[n];
-        for (int i = 0; i < n; i++) parent[i] = i;
+        UnionFind uf = new UnionFind(n);
 
         for (int e = 0; e < branches.size(); e++) {
             if (!active[e]) continue;
             BranchSpec br = branches.get(e);
-            union(parent, br.a(), br.b());
+            uf.union(br.a(), br.b());
         }
 
         double[] componentCapacitance = new double[n];
         for (int i = 0; i < n; i++) {
-            componentCapacitance[find(parent, i)] += nodes.get(i).capacitance();
+            componentCapacitance[uf.find(i)] += nodes.get(i).capacitance();
         }
 
         for (int e = 0; e < branches.size(); e++) {
             if (!active[e]) continue;
-            if (componentCapacitance[find(parent, branches.get(e).a())] <= 0) {
+            if (componentCapacitance[uf.find(branches.get(e).a())] <= 0) {
                 active[e] = false;
             }
         }
-    }
-
-    private static int find(int[] parent, int i) {
-        while (parent[i] != i) {
-            parent[i] = parent[parent[i]];
-            i = parent[i];
-        }
-        return i;
-    }
-
-    private static void union(int[] parent, int a, int b) {
-        parent[find(parent, a)] = find(parent, b);
     }
 
     /**
@@ -354,37 +456,118 @@ public final class NetworkSolver {
     private static double[] solveHeads(List<NodeSpec> nodes, List<BranchSpec> branches,
                                        boolean[] active, double[] gateScale, double dt) {
         int n = nodes.size();
-        double[][] a = new double[n][n];
-        double[] rhs = new double[n];
+        if (n <= DIRECT_SOLVE_LIMIT) {
+            double[][] a = new double[n][n];
+            double[] rhs = new double[n];
+            for (int i = 0; i < n; i++) {
+                a[i][i] = nodes.get(i).capacitance() / dt;
+                rhs[i] = a[i][i] * nodes.get(i).head();
+            }
+            for (int e = 0; e < branches.size(); e++) {
+                if (!active[e]) continue;
+                BranchSpec br = branches.get(e);
+                double c = gateScale[e] * br.conductance();
+                a[br.a()][br.a()] += c;
+                a[br.b()][br.b()] += c;
+                a[br.a()][br.b()] -= c;
+                a[br.b()][br.a()] -= c;
+                rhs[br.a()] -= c * br.emf();
+                rhs[br.b()] += c * br.emf();
+            }
+            for (int i = 0; i < n; i++) {
+                if (a[i][i] == 0) {
+                    a[i][i] = 1;
+                    rhs[i] = nodes.get(i).head();
+                }
+            }
+            return gaussianSolve(a, rhs);
+        }
+        return sparseConjugateGradient(nodes, branches, active, gateScale, dt);
+    }
 
+    /**
+     * Solve {@code (C/dt + L) h = rhs} for a large network without ever materializing the dense
+     * matrix. The Laplacian has only ~E nonzero off-diagonals, so a sparse matvec over the active
+     * branches plus a diagonal is O(n+E) per iteration instead of the dense O(n²). A Jacobi (diagonal)
+     * preconditioner collapses the stiff conditioning that reservoir capacitances (up to 4,000,000/dt
+     * against ~conductance junction rows) impose, and the loop stops on a PHYSICAL head tolerance
+     * (~1e-6 blocks) rather than machine precision. Scratch arrays are all allocated once. Matches the
+     * dense path's system exactly, so it is identical numerically to the direct solve on the same input.
+     */
+    private static double[] sparseConjugateGradient(List<NodeSpec> nodes, List<BranchSpec> branches,
+                                                    boolean[] active, double[] gateScale, double dt) {
+        int n = nodes.size();
+        int m = branches.size();
+        double[] diag = new double[n];
+        double[] rhs = new double[n];
         for (int i = 0; i < n; i++) {
-            NodeSpec node = nodes.get(i);
-            a[i][i] = node.capacitance() / dt;
-            rhs[i] = node.capacitance() / dt * node.head();
+            double c = nodes.get(i).capacitance() / dt;
+            diag[i] = c;
+            rhs[i] = c * nodes.get(i).head();
         }
 
-        for (int e = 0; e < branches.size(); e++) {
+        // Fold each active branch into the diagonal + rhs, and record its off-diagonal stamp (a,b,c)
+        // for the matvec: A·p = diag∘p − Σ c·(p_b·e_a + p_a·e_b).
+        int[] ea = new int[m];
+        int[] eb = new int[m];
+        double[] ec = new double[m];
+        int edges = 0;
+        for (int e = 0; e < m; e++) {
             if (!active[e]) continue;
             BranchSpec br = branches.get(e);
             double c = gateScale[e] * br.conductance();
-            a[br.a()][br.a()] += c;
-            a[br.b()][br.b()] += c;
-            a[br.a()][br.b()] -= c;
-            a[br.b()][br.a()] -= c;
+            diag[br.a()] += c;
+            diag[br.b()] += c;
             rhs[br.a()] -= c * br.emf();
             rhs[br.b()] += c * br.emf();
+            ea[edges] = br.a();
+            eb[edges] = br.b();
+            ec[edges] = c;
+            edges++;
         }
-
         for (int i = 0; i < n; i++) {
-            if (a[i][i] == 0) {
-                a[i][i] = 1;
+            if (diag[i] == 0) {
+                diag[i] = 1;
                 rhs[i] = nodes.get(i).head();
             }
         }
 
-        return n <= DIRECT_SOLVE_LIMIT
-                ? gaussianSolve(a, rhs)
-                : conjugateGradient(a, rhs);
+        double[] x = new double[n];
+        double[] r = Arrays.copyOf(rhs, n); // r = rhs − A·x with x = 0
+        double[] z = new double[n];
+        double[] p = new double[n];
+        double[] ap = new double[n];
+        for (int i = 0; i < n; i++) {
+            z[i] = r[i] / diag[i];
+            p[i] = z[i];
+        }
+        double rzOld = dot(r, z);
+
+        for (int iter = 0; iter < 20 * n && rzOld > 0; iter++) {
+            for (int i = 0; i < n; i++) ap[i] = diag[i] * p[i];
+            for (int e = 0; e < edges; e++) {
+                ap[ea[e]] -= ec[e] * p[eb[e]];
+                ap[eb[e]] -= ec[e] * p[ea[e]];
+            }
+            double pap = dot(p, ap);
+            if (pap <= 0) break;
+            double alpha = rzOld / pap;
+            double maxStep = 0;
+            for (int i = 0; i < n; i++) {
+                double step = alpha * p[i];
+                x[i] += step;
+                r[i] -= alpha * ap[i];
+                double abs = Math.abs(step);
+                if (abs > maxStep) maxStep = abs;
+            }
+            if (maxStep < 1.0e-6) break; // heads settled to within 1e-6 blocks
+            for (int i = 0; i < n; i++) z[i] = r[i] / diag[i];
+            double rzNew = dot(r, z);
+            double beta = rzNew / rzOld;
+            for (int i = 0; i < n; i++) p[i] = z[i] + beta * p[i];
+            rzOld = rzNew;
+        }
+        return x;
     }
 
     private static double[] gaussianSolve(double[][] a, double[] rhs) {
@@ -415,43 +598,6 @@ public final class NetworkSolver {
             x[row] = Math.abs(a[row][row]) < 1.0e-12 ? 0 : sum / a[row][row];
         }
         return x;
-    }
-
-    private static double[] conjugateGradient(double[][] a, double[] rhs) {
-        int n = rhs.length;
-        double[] x = new double[n];
-        double[] r = Arrays.copyOf(rhs, n);
-        double[] p = Arrays.copyOf(rhs, n);
-        double rsOld = dot(r, r);
-        double tolerance = Math.max(1.0e-18, 1.0e-16 * rsOld);
-
-        for (int iter = 0; iter < 20 * n && rsOld > tolerance; iter++) {
-            double[] ap = multiply(a, p);
-            double pap = dot(p, ap);
-            if (pap <= 0) break;
-            double alpha = rsOld / pap;
-            for (int i = 0; i < n; i++) {
-                x[i] += alpha * p[i];
-                r[i] -= alpha * ap[i];
-            }
-            double rsNew = dot(r, r);
-            double beta = rsNew / rsOld;
-            for (int i = 0; i < n; i++) p[i] = r[i] + beta * p[i];
-            rsOld = rsNew;
-        }
-        return x;
-    }
-
-    private static double[] multiply(double[][] a, double[] v) {
-        int n = v.length;
-        double[] out = new double[n];
-        for (int i = 0; i < n; i++) {
-            double sum = 0;
-            double[] row = a[i];
-            for (int j = 0; j < n; j++) sum += row[j] * v[j];
-            out[i] = sum;
-        }
-        return out;
     }
 
     private static double dot(double[] a, double[] b) {

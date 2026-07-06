@@ -1,6 +1,7 @@
 package de.devin.pipesnphysics.engine;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.neoforged.neoforge.fluids.FluidStack;
 
 import java.util.ArrayList;
@@ -41,6 +42,12 @@ import java.util.Set;
  *                  the goggle can explain WHY a pump runs below its flow cap,
  *   noHeadEdges  — pump edges where the opposing head exceeds the pump's head:
  *                  the pump is simply too weak for the lift it faces,
+ *   heldEdges    — pump-fed runs dead-heading a shut gate (a closed valve): the pump
+ *                  HOLDS its pressurized column up to the gate (no flow crosses), so the
+ *                  renderer keeps it full instead of letting it recede, and it resumes
+ *                  the instant the gate reopens. The "head doesn't reset when blocked"
+ *                  behavior, generalized — sink-full / no-head runs already hold via the
+ *                  renderer's backed-up guard; this adds the case the solver used to drop,
  *   active       — whether any meaningful flow exists (used to keep ticking).
  *
  * {@link FluidEngine#apply} executes the transfers; the rest feeds the /pipegraph
@@ -57,6 +64,7 @@ public record Solution(
         Set<Integer> blockedEdges,
         Set<Integer> stalledEdges,
         Set<Integer> noHeadEdges,
+        Set<Integer> heldEdges,
         Map<Integer, Reason> edgeReasons,
         Map<Integer, PumpLoad> pumpLoads,
         boolean active
@@ -82,14 +90,22 @@ public record Solution(
     public record PumpLoad(double headSupplied, double headAgainst, double frictionFactor,
                            double drivingFlow) {}
 
-    /** One planned endpoint-to-endpoint movement; amount is the stack's amount in mB. */
-    public record Transfer(BlockPos from, BlockPos to, FluidStack fluid) {}
+    /**
+     * One planned endpoint-to-endpoint movement; amount is the stack's amount in mB. {@code fromFace}/
+     * {@code toFace} are the sides to drain/fill a SIDE-SPECIFIC handler through (see {@link
+     * BoundaryColumn#accessFace}); null means resolve side-agnostically.
+     */
+    public record Transfer(BlockPos from, Direction fromFace, BlockPos to, Direction toFace, FluidStack fluid) {
+        public Transfer(BlockPos from, BlockPos to, FluidStack fluid) {
+            this(from, null, to, null, fluid);
+        }
+    }
 
     public static Solution idle(Graph graph) {
         List<EdgeFlow> flows = new ArrayList<>(graph.edges().size());
         for (Edge e : graph.edges()) flows.add(EdgeFlow.none(e.index()));
         return new Solution(flows, List.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(),
-                Set.of(), Set.of(), Set.of(), Map.of(), Map.of(), false);
+                Set.of(), Set.of(), Set.of(), Set.of(), Map.of(), Map.of(), false);
     }
 
     public boolean hasTransfer() {

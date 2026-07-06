@@ -4,15 +4,12 @@ import com.simibubi.create.content.fluids.FluidPropagator;
 import com.simibubi.create.content.fluids.FluidTransportBehaviour;
 import com.simibubi.create.content.fluids.pipes.VanillaFluidTargets;
 import com.simibubi.create.content.fluids.pump.PumpBlock;
-import de.devin.pipesnphysics.PipesNPhysics;
+import com.simibubi.create.content.fluids.tank.FluidTankBlockEntity;
+import de.devin.pipesnphysics.mixin.FluidTankAccessor;
 import de.devin.pipesnphysics.compat.SableCompat;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
-import net.minecraft.core.registries.Registries;
-import net.minecraft.resources.ResourceLocation;
-import net.minecraft.tags.TagKey;
 import net.minecraft.world.level.Level;
-import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.neoforged.neoforge.capabilities.Capabilities;
 
@@ -47,20 +44,21 @@ import java.util.Set;
  * for its BlockPos references and the world-Y coordinates baked in at construction.
  */
 public final class GraphBuilder {
-    /**
-     * Blocks that hold fluid AND chain it to their neighbours (e.g. createpropulsion's
-     * liquid burner, whose own {@code PassthroughFluidHandler} relied on Create's now-
-     * cancelled push transport to spread fuel across a row). The engine threads tagged
-     * blocks into the network as connected tank-nodes and equalizes them itself, so a row
-     * shares fluid again. Packs/addons extend the tag; a missing block id is ignored.
-     */
-    private static final TagKey<Block> FLUID_CONDUITS = TagKey.create(Registries.BLOCK,
-            ResourceLocation.fromNamespaceAndPath(PipesNPhysics.ID, "fluid_conduits"));
-
     private GraphBuilder() {}
 
     private static boolean isConduit(Level level, BlockPos pos) {
-        return level.getBlockState(pos).is(FLUID_CONDUITS);
+        return level.getBlockState(pos).is(HandlerRoles.FLUID_CONDUITS);
+    }
+
+    /**
+     * Whether a cell is a fully-SHUT fluid valve — a fluid-independent closure (it rejects every
+     * fluid, both directions), so it can safely become a wall in the shared topology. A partially
+     * open valve still conducts (throttled), so it stays a normal pipe cell. Reads the engine's own
+     * {@link ValveThrottle} angle (0 = shut); inert when the throttle feature is off (returns 1).
+     */
+    private static boolean isClosedGate(Level level, BlockPos pos) {
+        return level.getBlockEntity(pos) instanceof ValveThrottle valve
+                && valve.pipesnphysics$valveThrottle() <= 0f;
     }
 
     /**
@@ -84,7 +82,11 @@ public final class GraphBuilder {
         nodePositions.addAll(d.openEnds.keySet());
         for (BlockPos pipe : d.pipes) {
             int conns = d.connections.getOrDefault(pipe, List.of()).size();
-            if (conns != 2) nodePositions.add(pipe);
+            // A fully-shut valve is forced to a node so the run SPLITS there (a wall): the
+            // supply side holds its head up to the valve, the far side settles. The graph
+            // stays connected (the gate bridges two edges) — only the solver treats it as
+            // non-conducting — so coverage/dedupe/wake are unaffected.
+            if (conns != 2 || isClosedGate(level, pipe)) nodePositions.add(pipe);
         }
         // If no junctions/handlers/pumps exist, treat the start as the single node.
         if (nodePositions.isEmpty()) nodePositions.add(d.pipes.iterator().next());
@@ -96,6 +98,7 @@ public final class GraphBuilder {
             Node.Kind kind;
             Direction facing = null;
             Direction openFace = null;
+            Direction accessFace = null;
             if (d.pumps.contains(pos)) {
                 kind = Node.Kind.PUMP;
                 BlockState bs = level.getBlockState(pos);
@@ -104,14 +107,17 @@ public final class GraphBuilder {
                 }
             } else if (d.handlers.contains(pos)) {
                 kind = Node.Kind.HANDLER;
+                accessFace = d.handlerFaces.get(pos); // non-null only for a side-specific handler
             } else if (d.openEnds.containsKey(pos)) {
                 kind = Node.Kind.OPEN_END;
                 openFace = d.openEnds.get(pos);
+            } else if (isClosedGate(level, pos)) {
+                kind = Node.Kind.CLOSED_GATE;
             } else {
                 kind = Node.Kind.JUNCTION;
             }
             int idx = nodes.size();
-            nodes.add(new Node(idx, pos, kind, SableCompat.getWorldY(level, pos), facing, openFace));
+            nodes.add(new Node(idx, pos, kind, SableCompat.getWorldY(level, pos), facing, openFace, accessFace));
             indexOf.put(pos, idx);
         }
 
@@ -179,6 +185,7 @@ public final class GraphBuilder {
         final Set<BlockPos> pipes = new LinkedHashSet<>();   // pure pipe cells (incl. straight bits that pumps share via FluidTransportBehaviour are excluded — pumps are tracked separately)
         final Set<BlockPos> pumps = new LinkedHashSet<>();   // pump positions
         final Set<BlockPos> handlers = new LinkedHashSet<>(); // adjacent IFluidHandler positions
+        final Map<BlockPos, Direction> handlerFaces = new HashMap<>(); // side-specific handler -> its face toward the pipe
         final Map<BlockPos, Direction> openEnds = new LinkedHashMap<>(); // space pos -> face back toward its pipe
         final Map<BlockPos, List<BlockPos>> connections = new HashMap<>();
     }
@@ -227,17 +234,48 @@ public final class GraphBuilder {
                 // itself drains these through the open-end (VanillaFluidTargets) path, so
                 // let them fall through to the OPEN_END branch below, exactly as Create's
                 // own isOpenEnd does (it returns true for canProvideFluidWithoutCapability).
-                if (handler != null && !VanillaFluidTargets.canProvideFluidWithoutCapability(nState)) {
-                    d.handlers.add(neighbor.immutable());
+                // ignore_fluid_handler blocks (a relay that corrupts on both drain AND fill) are
+                // skipped as if they held no fluid — they fall through to the open-end / dead-end
+                // path below instead of joining the network as a tank node.
+                if (handler != null && !VanillaFluidTargets.canProvideFluidWithoutCapability(nState)
+                        && !HandlerRoles.isIgnored(level, neighbor)) {
+                    boolean firstSight = d.handlers.add(neighbor.immutable());
                     conns.add(neighbor.immutable());
+                    boolean sideAgnostic = level.getCapability(
+                            Capabilities.FluidHandler.BLOCK, neighbor, null) != null;
                     // A conduit handler is traversed THROUGH so its own chain is discovered.
-                    if (isConduit(level, neighbor)) frontier.add(neighbor.immutable());
+                    if (isConduit(level, neighbor)) {
+                        frontier.add(neighbor.immutable());
+                    } else if (!sideAgnostic) {
+                        // A SIDE-SPECIFIC handler (no null-side capability): record the face this pipe
+                        // meets it on so the endpoint resolves and transfers through that exact tank, and
+                        // do NOT couple its other faces — those are DIFFERENT tanks and belong to their own
+                        // networks (that is how one block serves a different fluid per side). face is the
+                        // handler's face toward this pipe (opposite the pipe's opening direction).
+                        d.handlerFaces.putIfAbsent(neighbor.immutable(), face.getOpposite());
+                    } else if (firstSight) {
+                        // A side-agnostic tank/basin couples EVERY run that touches it — fluid flows
+                        // run→tank→run through the shared reservoir — so discover the OTHER runs on its
+                        // footprint into this same graph. Without this a tank with two connections split
+                        // into two independent networks, each solving the tank's fill blind to the other,
+                        // so a full pass-through tank wrongly reported "destination full" on its inflow run.
+                        exploreHandlerRuns(level, neighbor, frontier);
+                    }
                     continue;
                 }
 
-                if (FluidPropagator.getPipe(level, neighbor) != null) {
-                    conns.add(neighbor.immutable());
-                    frontier.add(neighbor.immutable());
+                // Link to a neighbouring pipe ONLY if it opens back toward us. `getPipeConnections`
+                // reports the faces THIS pipe opens on (one-sided); Create's own propagation also
+                // checks the target's reciprocal opening. On the main world the two states are kept
+                // mutually consistent so the check is moot, but a Sable sub-level never re-runs the
+                // connection update (its BEs don't tick), so a stale one-sided opening would
+                // otherwise bridge two pipes that are not actually connected (a phantom edge).
+                var neighborPipe = FluidPropagator.getPipe(level, neighbor);
+                if (neighborPipe != null) {
+                    if (neighborPipe.canHaveFlowToward(nState, face.getOpposite())) {
+                        conns.add(neighbor.immutable());
+                        frontier.add(neighbor.immutable());
+                    }
                     continue;
                 }
 
@@ -272,6 +310,48 @@ public final class GraphBuilder {
     }
 
     /**
+     * Queue every pipe run connected to a handler's footprint, so all runs sharing a tank/basin land
+     * in ONE network — they are hydraulically coupled through the shared reservoir. Only a pipe that
+     * actually opens back toward the footprint is followed (not one merely passing by).
+     */
+    private static void exploreHandlerRuns(Level level, BlockPos handlerPos, Queue<BlockPos> frontier) {
+        for (BlockPos block : handlerExtent(level, handlerPos)) {
+            for (Direction face : Direction.values()) {
+                BlockPos neighbor = block.relative(face);
+                if (!level.isLoaded(neighbor)) continue;
+                FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, neighbor);
+                if (pipe == null) continue;
+                BlockState pipeState = level.getBlockState(neighbor);
+                if (FluidPropagator.getPipeConnections(pipeState, pipe).contains(face.getOpposite())) {
+                    frontier.add(neighbor.immutable());
+                }
+            }
+        }
+    }
+
+    /** The block(s) a handler occupies: a multiblock tank's whole footprint, or just the single block. */
+    private static List<BlockPos> handlerExtent(Level level, BlockPos pos) {
+        if (level.getBlockEntity(pos) instanceof FluidTankBlockEntity tank) {
+            FluidTankBlockEntity controller = tank.getControllerBE();
+            if (controller != null) {
+                int width = ((FluidTankAccessor) (Object) controller).pipesnphysics$getWidth();
+                int height = ((FluidTankAccessor) (Object) controller).pipesnphysics$getHeight();
+                BlockPos base = controller.getBlockPos();
+                List<BlockPos> blocks = new ArrayList<>(width * width * height);
+                for (int dx = 0; dx < width; dx++) {
+                    for (int dy = 0; dy < height; dy++) {
+                        for (int dz = 0; dz < width; dz++) {
+                            blocks.add(base.offset(dx, dy, dz));
+                        }
+                    }
+                }
+                return blocks;
+            }
+        }
+        return List.of(pos);
+    }
+
+    /**
      * Explore a fluid-conduit block: a fluid-holding node the BFS traverses THROUGH,
      * linking it to adjacent pumps, pipes, other conduits, and plain handlers on every
      * face — so a row of conduits (e.g. chained liquid burners) becomes one connected
@@ -290,7 +370,8 @@ public final class GraphBuilder {
                 frontier.add(neighbor.immutable());
                 continue;
             }
-            if (level.getCapability(Capabilities.FluidHandler.BLOCK, neighbor, face.getOpposite()) != null) {
+            if (level.getCapability(Capabilities.FluidHandler.BLOCK, neighbor, face.getOpposite()) != null
+                    && !HandlerRoles.isIgnored(level, neighbor)) {
                 d.handlers.add(neighbor.immutable());
                 conns.add(neighbor.immutable());
                 if (isConduit(level, neighbor)) frontier.add(neighbor.immutable());

@@ -6,11 +6,16 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.phys.Vec3;
 
+import java.util.function.BiFunction;
+
 interface SableCompatProvider {
     void clearCaches();
+    <T> T atOverlappingContraptions(Level level, BlockPos origin, BiFunction<Level, BlockPos, T> reader);
     boolean isSubLevelReady(Level level, BlockPos pos);
     double getWorldY(Level level, BlockPos pos);
     Vec3 getWorldPos(Level level, BlockPos pos);
+    double getUpProjectionY(Level level, BlockPos pos);
+    double getColumnBaseY(Level level, BlockPos pos, int width, int height);
     float getTiltAngle(Level level, BlockPos pos);
     float getTiltAngleClient(BlockEntity be);
     float getPipeElevation(Level level, BlockPos pos, Direction dir);

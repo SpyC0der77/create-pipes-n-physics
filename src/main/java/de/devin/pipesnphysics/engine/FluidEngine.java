@@ -1,7 +1,9 @@
 package de.devin.pipesnphysics.engine;
 
+import com.simibubi.create.content.fluids.hosePulley.HosePulleyBlockEntity;
 import com.simibubi.create.content.fluids.pipes.VanillaFluidTargets;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerLevel;
 import net.neoforged.neoforge.fluids.FluidStack;
 import net.neoforged.neoforge.fluids.capability.IFluidHandler;
@@ -35,14 +37,6 @@ import java.util.List;
 public final class FluidEngine {
     private FluidEngine() {}
 
-    /** Run one full tick (build, solve, apply) on the network containing seedPos. */
-    public static Solution tick(ServerLevel level, BlockPos seedPos) {
-        Graph graph = GraphBuilder.build(level, seedPos);
-        Solution solution = FlowSolver.solve(level, graph);
-        apply(level, solution);
-        return solution;
-    }
-
     /** Build a graph without solving. Used by /pipegraph and the overlay. */
     public static Graph buildGraph(ServerLevel level, BlockPos seedPos) {
         return GraphBuilder.build(level, seedPos);
@@ -55,41 +49,43 @@ public final class FluidEngine {
     }
 
     /**
-     * Execute the planned transfers. Capabilities are looked up again here — the
-     * world may have changed since the solve — and each transfer is clamped by what
-     * the source can actually give and the sink can actually take, so a stale plan
-     * degrades to a smaller (or zero) transfer instead of an error.
-     */
-    public static void apply(ServerLevel level, Solution solution) {
-        apply(level, solution.transfers());
-    }
-
-    /**
-     * Execute a specific set of transfers — used when the caller has held some back
-     * (e.g. until the visual fluid front reaches the sink, see {@code EngineTickHandler}).
+     * Execute a set of transfers — the caller may hold some back (e.g. until the visual fluid front
+     * reaches the sink, see {@code EngineTickHandler}). Capabilities are looked up again here — the
+     * world may have changed since the solve — and each transfer is clamped by what the source can
+     * actually give and the sink can actually take, so a stale plan degrades to a smaller (or zero)
+     * transfer instead of an error.
      */
     public static void apply(ServerLevel level, List<Solution.Transfer> transfers) {
         for (Solution.Transfer transfer : transfers) {
-            IFluidHandler source = handlerAt(level, transfer.from());
-            IFluidHandler sink = handlerAt(level, transfer.to());
+            IFluidHandler source = handlerAt(level, transfer.from(), transfer.fromFace());
+            IFluidHandler sink = handlerAt(level, transfer.to(), transfer.toFace());
             if (source == null || sink == null) continue;
 
-            FluidStack drained = source.drain(transfer.fluid().copy(), FluidAction.SIMULATE);
+            FluidStack drained = BoundaryColumn.drainMatching(source, transfer.fluid().copy(), FluidAction.SIMULATE);
             if (drained.isEmpty()) continue;
             int accepted = sink.fill(drained, FluidAction.SIMULATE);
             if (accepted <= 0) continue;
 
-            FluidStack moved = source.drain(
+            FluidStack moved = BoundaryColumn.drainMatching(source,
                     transfer.fluid().copyWithAmount(Math.min(accepted, drained.getAmount())),
                     FluidAction.EXECUTE);
             if (moved.isEmpty()) continue;
             sink.fill(moved, FluidAction.EXECUTE);
+
+            // Tell the relay detector how much WE moved, so next tick it can subtract our fill and see
+            // whether a handler gained fluid on its own (the relay signature).
+            RelayDetector.recordApplied(transfer.from(), -moved.getAmount());
+            RelayDetector.recordApplied(transfer.to(), moved.getAmount());
 
             // A transfer INTO an open end is a spill (intake has the open end as the
             // SOURCE). Stamp it so the network won't suck a finite source back in for a
             // cooldown — the no-reclaim guard for hand-placed-source intake.
             if (BoundaryColumn.findHandler(level, transfer.to()) == null) {
                 OpenEndPipes.markSpilled(level, transfer.to());
+            } else if (level.getBlockEntity(transfer.to()) instanceof HosePulleyBlockEntity) {
+                // A transfer INTO a pulley pushes fluid out to the world; hold it as a one-way
+                // sink for the cooldown so drain-priority does not reclaim the fresh block.
+                OpenEndPipes.markPulleyDeposited(level, transfer.to());
             }
         }
     }
@@ -103,9 +99,9 @@ public final class FluidEngine {
      * capability here would refuse every sub-1000 mB transfer and show flow while moving
      * nothing — the same hijack that misclassified the node, one layer down.
      */
-    private static IFluidHandler handlerAt(ServerLevel level, BlockPos pos) {
+    private static IFluidHandler handlerAt(ServerLevel level, BlockPos pos, Direction face) {
         if (!VanillaFluidTargets.canProvideFluidWithoutCapability(level.getBlockState(pos))) {
-            IFluidHandler handler = BoundaryColumn.findHandler(level, pos);
+            IFluidHandler handler = BoundaryColumn.findHandler(level, pos, face);
             if (handler != null) return handler;
         }
         return OpenEndPipes.existing(level, pos);

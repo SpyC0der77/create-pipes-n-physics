@@ -16,6 +16,7 @@ import org.joml.Vector3d;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiFunction;
 
 class SableCompanionImpl implements SableCompatProvider {
     private static final double NORMALIZE_EPSILON = 0.001;
@@ -24,6 +25,19 @@ class SableCompanionImpl implements SableCompatProvider {
     @Override
     public void clearCaches() {
         lastOrientations.clear();
+    }
+
+    @Override
+    public <T> T atOverlappingContraptions(Level level, BlockPos origin, BiFunction<Level, BlockPos, T> reader) {
+        // Sable's own traversal: project `origin` out to world space, then for every OTHER contraption
+        // whose bounds contain that point, inverse-project to its plot pos and hand the block to `reader`;
+        // it short-circuits on the first non-null result. `origin`'s own sub-level (subA, null on the main
+        // level) is passed so the traversal skips it. We reject the host-world hit (subB == null, already
+        // read by the caller) so only genuine other-contraption blocks reach `reader`.
+        SubLevelAccess subA = SableCompanion.INSTANCE.getContaining(level, origin);
+        Vec3 center = new Vec3(origin.getX() + 0.5, origin.getY() + 0.5, origin.getZ() + 0.5);
+        return SableCompanion.INSTANCE.runIncludingSubLevels(level, center, false, subA,
+                (SubLevelAccess subB, BlockPos plotPosB) -> subB == null ? null : reader.apply(level, plotPosB));
     }
 
     @Override
@@ -45,6 +59,30 @@ class SableCompanionImpl implements SableCompatProvider {
         Vector3d result = SableCompanion.INSTANCE.projectOutOfSubLevel(level,
                 new Vector3d(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5), new Vector3d());
         return new Vec3(result.x, result.y, result.z);
+    }
+
+    @Override
+    public double getUpProjectionY(Level level, BlockPos pos) {
+        SubLevelAccess sub = SableCompanion.INSTANCE.getContaining(level, pos);
+        if (sub == null) return 1.0;
+        Pose3dc pose = sub.logicalPose();
+        if (pose == null) return 1.0;
+        Vector3d up = pose.transformNormal(new Vector3d(0, 1, 0), new Vector3d());
+        double len = Math.sqrt(up.x * up.x + up.y * up.y + up.z * up.z);
+        if (len < NORMALIZE_EPSILON) return 1.0;
+        return Math.clamp(up.y / len, 0.0, 1.0); // cos(tilt): a fluid column rises along local-up, not world-up
+    }
+
+    @Override
+    public double getColumnBaseY(Level level, BlockPos pos, int width, int height) {
+        // Anchor at the box's projected geometric CENTER, not the bottom corner: on a tilt the
+        // corner the controller sits at is not the lowest point, so baseY = getWorldY(controller)-0.5
+        // skews the surface and spills a partial tank. The center projects exactly, and the surface
+        // is then center + (fillFraction - 0.5)·height·cosTilt — i.e. baseY = center − 0.5·height·cosTilt.
+        Vector3d center = SableCompanion.INSTANCE.projectOutOfSubLevel(level,
+                new Vector3d(pos.getX() + width / 2.0, pos.getY() + height / 2.0, pos.getZ() + width / 2.0),
+                new Vector3d());
+        return center.y - 0.5 * height * getUpProjectionY(level, pos);
     }
 
     @Override

@@ -5,7 +5,9 @@
   "pipesnphysics.gui.goggles.not_connected": "No Flow: not connected to a network",
   "pipesnphysics.gui.goggles.no_flow_dry": "No Flow: pipe is dry, nothing reaching it",
   "pipesnphysics.gui.goggles.no_flow_starved": "No Flow: pump can't pull its supply (check the source)",
+  "pipesnphysics.gui.goggles.no_flow_no_output": "No Flow: the pump has nowhere to push (its output isn't connected)",
   "pipesnphysics.gui.goggles.no_flow_settled": "No Flow: settled, levels are balanced",
+  "pipesnphysics.gui.goggles.held": "No Flow: holding pressure, a valve is shut ahead",
   "pipesnphysics.gui.goggles.blocked": "No Flow: this line is shut",
   "pipesnphysics.gui.goggles.stalled": "No Flow: the tank or machine ahead is full",
   "pipesnphysics.gui.goggles.no_head": "No Flow: not enough RPM to lift this high",
@@ -40,10 +42,34 @@
   "pipesnphysics.gui.goggles.fluid_weight": "Weight: ",
   "pipesnphysics.gui.goggles.kg": " kg",
 
+  "pipesnphysics.gui.valve.throttle": "Valve Flow",
+  "pipesnphysics.gui.goggles.valve_stats": "Valve",
+  "pipesnphysics.gui.goggles.valve_opening": "Letting through: ",
+  "pipesnphysics.gui.goggles.valve_shut_throttle": "No Flow: cranked shut",
+
   "pipesnphysics.direction.north": "→ North",
   "pipesnphysics.direction.south": "→ South",
   "pipesnphysics.direction.east": "→ East",
   "pipesnphysics.direction.west": "→ West",
   "pipesnphysics.direction.up": "→ Up",
-  "pipesnphysics.direction.down": "→ Down"
+  "pipesnphysics.direction.down": "→ Down",
+
+  "pipesnphysics.ponder.tag.pipe_physics": "Pipe Physics",
+  "pipesnphysics.ponder.tag.pipe_physics.description": "Realistic fluid pressure, lift limits, and flow for Create pipe networks",
+
+  "pipesnphysics.ponder.fluid_dynamics.header": "Fluid Dynamics",
+  "pipesnphysics.ponder.fluid_dynamics.text_1": "Fluid naturally flows from high to low pressure",
+  "pipesnphysics.ponder.fluid_dynamics.text_2": "A vertical drop creates 'head', pushing fluid down",
+  "pipesnphysics.ponder.fluid_dynamics.text_3": "Without a pump, connected tanks will equalize their levels",
+  "pipesnphysics.ponder.fluid_dynamics.text_4": "Long pipe runs add friction, slowing down the flow",
+  "pipesnphysics.ponder.fluid_dynamics.text_5": "A Mechanical Pump adds extra head to overcome gravity or friction",
+  "pipesnphysics.ponder.fluid_dynamics.text_6": "The pump's lift capacity depends directly on its RPM",
+  "pipesnphysics.ponder.fluid_dynamics.text_7": "Higher RPM allows pumping to greater heights",
+
+  "pipesnphysics.ponder.siphons.header": "Siphons & Suction",
+  "pipesnphysics.ponder.siphons.text_1": "Pumps can pull fluid up, creating suction in the pipes",
+  "pipesnphysics.ponder.siphons.text_2": "This allows for siphoning over crests",
+  "pipesnphysics.ponder.siphons.text_3": "However, if suction is too high, the fluid column breaks",
+  "pipesnphysics.ponder.siphons.text_4": "This 'air break' stops all flow until the crest is lowered or pressure is added",
+  "pipesnphysics.ponder.siphons.text_5": "Use Engineer's Goggles to monitor suction and find air breaks"
 }
